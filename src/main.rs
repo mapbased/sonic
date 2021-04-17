@@ -18,19 +18,24 @@ extern crate byteorder;
 extern crate fst;
 extern crate fst_levenshtein;
 extern crate fst_regex;
-extern crate graceful;
 extern crate hashbrown;
+#[cfg(unix)]
+#[cfg(feature = "alloc-jemalloc")]
+extern crate jemallocator;
 extern crate linked_hash_set;
+#[cfg(unix)]
+extern crate nix;
+extern crate radix;
 extern crate rand;
+extern crate regex;
 extern crate regex_syntax;
 extern crate rocksdb;
 extern crate toml;
 extern crate twox_hash;
 extern crate unicode_segmentation;
 extern crate whatlang;
-
-#[cfg(feature = "alloc-jemalloc")]
-extern crate jemallocator;
+#[cfg(windows)]
+extern crate winapi;
 
 mod channel;
 mod config;
@@ -47,20 +52,23 @@ use std::thread;
 use std::time::Duration;
 
 use clap::{App, Arg};
-use graceful::SignalGuard;
 use log::LevelFilter;
 
-use channel::listen::ChannelListenBuilder;
+use channel::listen::{ChannelListen, ChannelListenBuilder};
+use channel::statistics::ensure_states as ensure_states_channel_statistics;
 use config::config::Config;
 use config::logger::ConfigLogger;
 use config::reader::ConfigReader;
 use store::fst::StoreFSTPool;
+use store::kv::StoreKVPool;
 use tasker::runtime::TaskerBuilder;
+use tasker::shutdown::ShutdownSignal;
 
 struct AppArgs {
     config: String,
 }
 
+#[cfg(unix)]
 #[cfg(feature = "alloc-jemalloc")]
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
@@ -116,7 +124,7 @@ gen_spawn_managed!("tasker", spawn_tasker, THREAD_NAME_TASKER, TaskerBuilder);
 fn make_app_args() -> AppArgs {
     let matches = App::new(crate_name!())
         .version(crate_version!())
-        .author(crate_authors!("\n"))
+        .author(crate_authors!())
         .about(crate_description!())
         .arg(
             Arg::with_name("config")
@@ -137,6 +145,9 @@ fn make_app_args() -> AppArgs {
 fn ensure_states() {
     // Ensure all statics are valid (a `deref` is enough to lazily initialize them)
     let (_, _) = (APP_ARGS.deref(), APP_CONF.deref());
+
+    // Ensure per-module states
+    ensure_states_channel_statistics();
 }
 
 fn main() {
@@ -144,7 +155,7 @@ fn main() {
         LevelFilter::from_str(&APP_CONF.server.log_level).expect("invalid log level"),
     );
 
-    let signal_guard = SignalGuard::new();
+    let shutdown_signal = ShutdownSignal::new();
 
     info!("starting up");
 
@@ -159,8 +170,14 @@ fn main() {
 
     info!("started");
 
-    signal_guard.at_exit(move |signal| {
+    shutdown_signal.at_exit(move |signal| {
         info!("stopping gracefully (got signal: {})", signal);
+
+        // Teardown Sonic Channel
+        ChannelListen::teardown();
+
+        // Perform a KV flush (ensures all in-memory changes are synced on-disk before shutdown)
+        StoreKVPool::flush(true);
 
         // Perform a FST consolidation (ensures all in-memory items are synced on-disk before \
         //   shutdown; otherwise we would lose all non-consolidated FST changes)

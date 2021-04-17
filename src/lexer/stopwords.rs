@@ -29,7 +29,7 @@ lazy_static! {
 lazy_static! {
     static ref STOPWORDS_UKR: HashSet<&'static str> = make(ukr::STOPWORDS_UKR);
     static ref STOPWORDS_KAT: HashSet<&'static str> = make(kat::STOPWORDS_KAT);
-    static ref STOPWORDS_ARB: HashSet<&'static str> = make(arb::STOPWORDS_ARB);
+    static ref STOPWORDS_ARA: HashSet<&'static str> = make(ara::STOPWORDS_ARA);
     static ref STOPWORDS_HIN: HashSet<&'static str> = make(hin::STOPWORDS_HIN);
     static ref STOPWORDS_JPN: HashSet<&'static str> = make(jpn::STOPWORDS_JPN);
     static ref STOPWORDS_HEB: HashSet<&'static str> = make(heb::STOPWORDS_HEB);
@@ -123,12 +123,15 @@ lazy_static! {
     static ref STOPWORDS_ILO: HashSet<&'static str> = make(ilo::STOPWORDS_ILO);
 }
 
-// Recursion group #9 (4 items)
+// Recursion group #9 (7 items)
 lazy_static! {
     static ref STOPWORDS_RUN: HashSet<&'static str> = make(run::STOPWORDS_RUN);
     static ref STOPWORDS_SNA: HashSet<&'static str> = make(sna::STOPWORDS_SNA);
     static ref STOPWORDS_UIG: HashSet<&'static str> = make(uig::STOPWORDS_UIG);
     static ref STOPWORDS_AFR: HashSet<&'static str> = make(afr::STOPWORDS_AFR);
+    static ref STOPWORDS_LAT: HashSet<&'static str> = make(lat::STOPWORDS_LAT);
+    static ref STOPWORDS_SLK: HashSet<&'static str> = make(slk::STOPWORDS_SLK);
+    static ref STOPWORDS_CAT: HashSet<&'static str> = make(cat::STOPWORDS_CAT);
 }
 
 fn make<'a>(words: &[&'a str]) -> HashSet<&'a str> {
@@ -139,7 +142,7 @@ impl LexerStopWord {
     pub fn is(word: &str, locale: Option<Lang>) -> bool {
         if let Some(locale) = locale {
             // Word is a stopword (given locale)
-            if Self::lang_stopwords(locale).contains(word) == true {
+            if Self::lang_stopwords(locale).contains(word) {
                 return true;
             }
         }
@@ -171,14 +174,14 @@ impl LexerStopWord {
         for script_lang in script_langs {
             let lang_stopwords = Self::lang_stopwords(*script_lang);
 
-            if lang_stopwords.is_empty() == false {
+            if !lang_stopwords.is_empty() {
                 let mut lang_count = 0;
 
                 // This is a simple split, that does not take into account uppercase letters and \
                 //   punctuation, as to prevent memory allocations and other heavy operations. \
                 //   Trade-offs are made as this is a best-effort last-resort check.
                 for word in &text_split {
-                    if lang_stopwords.contains(word) == true {
+                    if lang_stopwords.contains(word) {
                         lang_count += 1;
                     }
                 }
@@ -216,7 +219,7 @@ impl LexerStopWord {
             Lang::Deu => &*STOPWORDS_DEU,
             Lang::Ukr => &*STOPWORDS_UKR,
             Lang::Kat => &*STOPWORDS_KAT,
-            Lang::Arb => &*STOPWORDS_ARB,
+            Lang::Ara => &*STOPWORDS_ARA,
             Lang::Hin => &*STOPWORDS_HIN,
             Lang::Jpn => &*STOPWORDS_JPN,
             Lang::Heb => &*STOPWORDS_HEB,
@@ -288,6 +291,9 @@ impl LexerStopWord {
             Lang::Sna => &*STOPWORDS_SNA,
             Lang::Uig => &*STOPWORDS_UIG,
             Lang::Afr => &*STOPWORDS_AFR,
+            Lang::Lat => &*STOPWORDS_LAT,
+            Lang::Slk => &*STOPWORDS_SLK,
+            Lang::Cat => &*STOPWORDS_CAT,
         }
     }
 
@@ -342,6 +348,9 @@ impl LexerStopWord {
                 Lang::Epo,
                 Lang::Lav,
                 Lang::Est,
+                Lang::Lat,
+                Lang::Slk,
+                Lang::Cat,
             ],
             Script::Cyrillic => &[
                 Lang::Rus,
@@ -353,7 +362,7 @@ impl LexerStopWord {
                 Lang::Tuk,
                 Lang::Mkd,
             ],
-            Script::Arabic => &[Lang::Arb, Lang::Urd, Lang::Skr, Lang::Uig, Lang::Pes],
+            Script::Arabic => &[Lang::Ara, Lang::Urd, Lang::Skr, Lang::Uig, Lang::Pes],
             Script::Devanagari => &[Lang::Hin, Lang::Mar, Lang::Mai, Lang::Bho, Lang::Nep],
             Script::Ethiopic => &[Lang::Amh, Lang::Tir],
             Script::Hebrew => &[Lang::Heb, Lang::Ydd],
@@ -389,6 +398,7 @@ mod tests {
         assert_eq!(LexerStopWord::is("fox", Some(Lang::Eng)), false);
         assert_eq!(LexerStopWord::is("bonjour", Some(Lang::Fra)), false);
         assert_eq!(LexerStopWord::is("ici", Some(Lang::Fra)), true);
+        assert_eq!(LexerStopWord::is("adéu", Some(Lang::Cat)), true);
     }
 
     #[test]
@@ -413,6 +423,13 @@ mod tests {
                 Script::Latin
             ),
             Some(Lang::Hun)
+        );
+        assert_eq!(
+            LexerStopWord::guess_lang(
+                "Tots els éssers humans neixen lliures i iguals en dignitat i en drets.",
+                Script::Latin
+            ),
+            Some(Lang::Cat)
         );
         assert_eq!(
             LexerStopWord::guess_lang("aux", Script::Latin),

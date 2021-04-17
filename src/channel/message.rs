@@ -11,9 +11,11 @@ use std::time::Instant;
 
 use super::command::{
     ChannelCommandBase, ChannelCommandControl, ChannelCommandError, ChannelCommandIngest,
-    ChannelCommandResponse, ChannelCommandSearch, COMMANDS_MODE_CONTROL, COMMANDS_MODE_INGEST,
-    COMMANDS_MODE_SEARCH,
+    ChannelCommandResponse, ChannelCommandResponseArgs, ChannelCommandSearch,
+    COMMANDS_MODE_CONTROL, COMMANDS_MODE_INGEST, COMMANDS_MODE_SEARCH,
 };
+use super::listen::CHANNEL_AVAILABLE;
+use super::statistics::{COMMANDS_TOTAL, COMMAND_LATENCY_BEST, COMMAND_LATENCY_WORST};
 use crate::LINE_FEED;
 
 pub struct ChannelMessage;
@@ -21,7 +23,7 @@ pub struct ChannelMessageModeSearch;
 pub struct ChannelMessageModeIngest;
 pub struct ChannelMessageModeControl;
 
-static COMMAND_ELAPSED_MILLIS_SLOW_WARN: u128 = 50;
+const COMMAND_ELAPSED_MILLIS_SLOW_WARN: u128 = 50;
 
 #[derive(PartialEq)]
 pub enum ChannelMessageResult {
@@ -46,30 +48,39 @@ impl ChannelMessage {
 
         let mut result = ChannelMessageResult::Continue;
 
-        // Handle response arguments to issued command
-        let response_args_groups = match M::handle(&message) {
-            Ok(resp_groups) => resp_groups
-                .iter()
-                .map(|resp| match resp {
-                    ChannelCommandResponse::Ok
-                    | ChannelCommandResponse::Pong
-                    | ChannelCommandResponse::Pending(_)
-                    | ChannelCommandResponse::Result(_)
-                    | ChannelCommandResponse::Event(_, _, _)
-                    | ChannelCommandResponse::Void
-                    | ChannelCommandResponse::Err(_) => resp.to_args(),
-                    ChannelCommandResponse::Ended(_) => {
-                        result = ChannelMessageResult::Close;
-                        resp.to_args()
-                    }
-                })
-                .collect(),
-            Err(reason) => vec![ChannelCommandResponse::Err(reason).to_args()],
-        };
+        // Process response for issued command
+        let response_args_groups: Vec<ChannelCommandResponseArgs>;
+
+        if *CHANNEL_AVAILABLE.read().unwrap() != true {
+            // Server going down, reject command
+            response_args_groups =
+                vec![ChannelCommandResponse::Err(ChannelCommandError::ShuttingDown).to_args()];
+        } else {
+            // Handle response arguments to issued command
+            response_args_groups = match M::handle(&message) {
+                Ok(resp_groups) => resp_groups
+                    .iter()
+                    .map(|resp| match resp {
+                        ChannelCommandResponse::Ok
+                        | ChannelCommandResponse::Pong
+                        | ChannelCommandResponse::Pending(_)
+                        | ChannelCommandResponse::Result(_)
+                        | ChannelCommandResponse::Event(_, _, _)
+                        | ChannelCommandResponse::Void
+                        | ChannelCommandResponse::Err(_) => resp.to_args(),
+                        ChannelCommandResponse::Ended(_) => {
+                            result = ChannelMessageResult::Close;
+                            resp.to_args()
+                        }
+                    })
+                    .collect(),
+                Err(reason) => vec![ChannelCommandResponse::Err(reason).to_args()],
+            };
+        }
 
         // Serve response messages on socket
         for response_args in response_args_groups {
-            if response_args.0.is_empty() == false {
+            if !response_args.0.is_empty() {
                 if let Some(ref values) = response_args.1 {
                     let values_string = values.join(" ");
 
@@ -107,17 +118,46 @@ impl ChannelMessage {
             );
         }
 
-        return result;
+        // Update command statistics
+        {
+            // Update performance measures
+            // Notice: commands that take 0ms are not accounted for there (ie. those are usually \
+            //   commands that do no work or I/O; they would make statistics less accurate)
+            // Important: acquire write locks instead of read + write locks, as to prevent \
+            //   deadlocks (explained here: https://github.com/valeriansaliou/sonic/pull/211)
+            let command_took_millis = command_took.as_millis() as u32;
+
+            {
+                let mut worst = COMMAND_LATENCY_WORST.write().unwrap();
+
+                if command_took_millis > *worst {
+                    *worst = command_took_millis;
+                }
+            }
+
+            {
+                let mut best = COMMAND_LATENCY_BEST.write().unwrap();
+
+                if command_took_millis > 0 && (*best == 0 || command_took_millis < *best) {
+                    *best = command_took_millis;
+                }
+            }
+
+            // Increment total commands
+            *COMMANDS_TOTAL.write().unwrap() += 1;
+        }
+
+        result
     }
 
-    fn extract<'a>(message: &'a str) -> (String, SplitWhitespace) {
+    fn extract(message: &str) -> (String, SplitWhitespace) {
         // Extract command name and arguments
         let mut parts = message.split_whitespace();
         let command = parts.next().unwrap_or("").to_uppercase();
 
         debug!("will dispatch search command: {}", command);
 
-        return (command, parts);
+        (command, parts)
     }
 }
 
@@ -149,6 +189,7 @@ impl ChannelMessageMode for ChannelMessageModeControl {
     fn handle(message: &str) -> Result<Vec<ChannelCommandResponse>, ChannelCommandError> {
         gen_channel_message_mode_handle!(message, COMMANDS_MODE_CONTROL, {
             "TRIGGER" => ChannelCommandControl::dispatch_trigger,
+            "INFO" => ChannelCommandControl::dispatch_info,
             "HELP" => ChannelCommandControl::dispatch_help,
         })
     }

@@ -7,13 +7,16 @@
 use hashbrown::HashMap;
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
+use std::path::Path;
 use std::str::{self, SplitWhitespace};
 use std::vec::Vec;
 
 use super::format::unescape;
+use super::statistics::ChannelStatistics;
 use crate::query::builder::{QueryBuilder, QueryBuilderResult};
-use crate::query::types::{QuerySearchLimit, QuerySearchOffset};
+use crate::query::types::{QueryGenericLang, QuerySearchLimit, QuerySearchOffset};
 use crate::store::fst::StoreFSTPool;
+use crate::store::kv::StoreKVPool;
 use crate::store::operation::StoreOperationDispatch;
 use crate::APP_CONF;
 
@@ -23,6 +26,7 @@ pub enum ChannelCommandError {
     NotFound,
     QueryError,
     InternalError,
+    ShuttingDown,
     PolicyReject(&'static str),
     InvalidFormat(&'static str),
     InvalidMetaKey((String, String)),
@@ -46,6 +50,8 @@ pub struct ChannelCommandSearch;
 pub struct ChannelCommandIngest;
 pub struct ChannelCommandControl;
 
+pub type ChannelCommandResponseArgs = (&'static str, Option<Vec<String>>);
+
 type ChannelResult = Result<Vec<ChannelCommandResponse>, ChannelCommandError>;
 type MetaPartsResult<'a> = Result<(&'a str, &'a str), (&'a str, &'a str)>;
 
@@ -56,14 +62,18 @@ const TEXT_PART_ESCAPE: char = '\\';
 const META_PART_GROUP_OPEN: char = '(';
 const META_PART_GROUP_CLOSE: char = ')';
 
+static BACKUP_KV_PATH: &'static str = "kv";
+static BACKUP_FST_PATH: &'static str = "fst";
+
 lazy_static! {
     pub static ref COMMANDS_MODE_SEARCH: Vec<&'static str> =
         vec!["QUERY", "SUGGEST", "PING", "HELP", "QUIT"];
     pub static ref COMMANDS_MODE_INGEST: Vec<&'static str> =
         vec!["PUSH", "POP", "COUNT", "FLUSHC", "FLUSHB", "FLUSHO", "PING", "HELP", "QUIT"];
     pub static ref COMMANDS_MODE_CONTROL: Vec<&'static str> =
-        vec!["TRIGGER", "PING", "HELP", "QUIT"];
-    pub static ref CONTROL_TRIGGER_ACTIONS: Vec<&'static str> = vec!["consolidate"];
+        vec!["TRIGGER", "INFO", "PING", "HELP", "QUIT"];
+    pub static ref CONTROL_TRIGGER_ACTIONS: Vec<&'static str> =
+        vec!["consolidate", "backup", "restore"];
     static ref MANUAL_MODE_SEARCH: HashMap<&'static str, &'static Vec<&'static str>> =
         [("commands", &*COMMANDS_MODE_SEARCH)]
             .iter()
@@ -88,6 +98,7 @@ impl ChannelCommandError {
             ChannelCommandError::NotFound => String::from("not_found"),
             ChannelCommandError::QueryError => String::from("query_error"),
             ChannelCommandError::InternalError => String::from("internal_error"),
+            ChannelCommandError::ShuttingDown => String::from("shutting_down"),
             ChannelCommandError::PolicyReject(reason) => format!("policy_reject({})", reason),
             ChannelCommandError::InvalidFormat(format) => format!("invalid_format({})", format),
             ChannelCommandError::InvalidMetaKey(ref data) => {
@@ -101,7 +112,7 @@ impl ChannelCommandError {
 }
 
 impl ChannelCommandResponse {
-    pub fn to_args(&self) -> (&'static str, Option<Vec<String>>) {
+    pub fn to_args(&self) -> ChannelCommandResponseArgs {
         // Convert internal response to channel response arguments; this either gives 'RESPONSE' \
         //   or 'RESPONSE <value:1> <value:2> <..>' whether there are values or not.
         match *self {
@@ -149,7 +160,7 @@ impl ChannelCommandBase {
                 ))])
             }
             (Some(manual_key), next_part) => {
-                if next_part.is_none() == true {
+                if next_part.is_none() {
                     if let Some(manual_data) = manuals.get(manual_key) {
                         Ok(vec![ChannelCommandResponse::Result(format!(
                             "{}({})",
@@ -166,12 +177,12 @@ impl ChannelCommandBase {
         }
     }
 
-    pub fn parse_text_parts<'a>(parts: &'a mut SplitWhitespace) -> Option<String> {
+    pub fn parse_text_parts(parts: &mut SplitWhitespace) -> Option<String> {
         // Parse text parts and nest them together
         let mut text_raw = String::new();
 
         while let Some(text_part) = parts.next() {
-            if text_raw.is_empty() == false {
+            if !text_raw.is_empty() {
                 text_raw.push_str(" ");
             }
 
@@ -209,7 +220,7 @@ impl ChannelCommandBase {
         let text_bytes = text_raw.as_bytes();
         let text_bytes_len = text_bytes.len();
 
-        if text_raw.is_empty() == true
+        if text_raw.is_empty()
             || text_bytes_len < 2
             || text_bytes[0] as char != TEXT_PART_BOUNDARY
             || text_bytes[text_bytes_len - 1] as char != TEXT_PART_BOUNDARY
@@ -231,7 +242,7 @@ impl ChannelCommandBase {
                     debug!("parsed text parts (post-processed): {}", text_inner_string);
 
                     // Text must not be empty
-                    if text_inner_string.is_empty() == false {
+                    if !text_inner_string.is_empty() {
                         Some(text_inner_string)
                     } else {
                         None
@@ -254,7 +265,7 @@ impl ChannelCommandBase {
     ) -> Option<MetaPartsResult<'a>> {
         if let Some(part) = parts.next() {
             // Parse meta (with format: 'KEY(VALUE)'; no '(' or ')' is allowed in KEY and VALUE)
-            if part.is_empty() == false {
+            if !part.is_empty() {
                 if let Some(index_open) = part.find(META_PART_GROUP_OPEN) {
                     let (key_bound_start, key_bound_end) = (0, index_open);
                     let (value_bound_start, value_bound_end) = (index_open + 1, part.len() - 1);
@@ -266,10 +277,10 @@ impl ChannelCommandBase {
                         );
 
                         // Ensure final key and value do not contain reserved syntax characters
-                        return if key.contains(META_PART_GROUP_OPEN) == false
-                            && key.contains(META_PART_GROUP_CLOSE) == false
-                            && value.contains(META_PART_GROUP_OPEN) == false
-                            && value.contains(META_PART_GROUP_CLOSE) == false
+                        return if !key.contains(META_PART_GROUP_OPEN)
+                            && !key.contains(META_PART_GROUP_CLOSE)
+                            && !value.contains(META_PART_GROUP_OPEN)
+                            && !value.contains(META_PART_GROUP_CLOSE)
                         {
                             debug!("parsed meta part as: {} = {}", key, value);
 
@@ -302,14 +313,14 @@ impl ChannelCommandBase {
         ChannelCommandError::InvalidMetaValue((meta_key.to_owned(), meta_value.to_owned()))
     }
 
-    pub fn commit_ok_operation<'a>(query_builder: QueryBuilderResult<'a>) -> ChannelResult {
+    pub fn commit_ok_operation(query_builder: QueryBuilderResult) -> ChannelResult {
         query_builder
             .and_then(|query| StoreOperationDispatch::dispatch(query))
             .and_then(|_| Ok(vec![ChannelCommandResponse::Ok]))
             .or(Err(ChannelCommandError::QueryError))
     }
 
-    pub fn commit_result_operation<'a>(query_builder: QueryBuilderResult<'a>) -> ChannelResult {
+    pub fn commit_result_operation(query_builder: QueryBuilderResult) -> ChannelResult {
         query_builder
             .and_then(|query| StoreOperationDispatch::dispatch(query))
             .or(Err(ChannelCommandError::QueryError))
@@ -376,8 +387,8 @@ impl ChannelCommandSearch {
                 );
 
                 // Define query parameters
-                let mut query_limit = APP_CONF.channel.search.query_limit_default;
-                let mut query_offset = 0;
+                let (mut query_limit, mut query_offset, mut query_lang) =
+                    (APP_CONF.channel.search.query_limit_default, 0, None);
 
                 // Parse meta parts (meta comes after text; extract meta parts second)
                 let mut last_meta_err = None;
@@ -385,8 +396,15 @@ impl ChannelCommandSearch {
                 while let Some(meta_result) = ChannelCommandBase::parse_next_meta_parts(&mut parts)
                 {
                     match Self::handle_query_meta(meta_result) {
-                        Ok((Some(query_limit_parsed), None)) => query_limit = query_limit_parsed,
-                        Ok((None, Some(query_offset_parsed))) => query_offset = query_offset_parsed,
+                        Ok((Some(query_limit_parsed), None, None)) => {
+                            query_limit = query_limit_parsed
+                        }
+                        Ok((None, Some(query_offset_parsed), None)) => {
+                            query_offset = query_offset_parsed
+                        }
+                        Ok((None, None, Some(query_lang_parsed))) => {
+                            query_lang = Some(query_lang_parsed)
+                        }
                         Err(parse_err) => last_meta_err = Some(parse_err),
                         _ => {}
                     }
@@ -402,8 +420,8 @@ impl ChannelCommandSearch {
                     ))
                 } else {
                     debug!(
-                        "will search for #{} with text: {}, limit: {}, offset: {}",
-                        event_id, text, query_limit, query_offset
+                        "will search for #{} with text: {}, limit: {}, offset: {}, locale: <{:?}>",
+                        event_id, text, query_limit, query_offset, query_lang
                     );
 
                     // Commit 'search' query
@@ -417,12 +435,14 @@ impl ChannelCommandSearch {
                             &text,
                             query_limit,
                             query_offset,
+                            query_lang,
                         ),
                     )
                 }
             }
             _ => Err(ChannelCommandError::InvalidFormat(
-                "QUERY <collection> <bucket> \"<terms>\" [LIMIT(<count>)]? [OFFSET(<count>)]?",
+                "QUERY <collection> <bucket> \"<terms>\" [LIMIT(<count>)]? [OFFSET(<count>)]? \
+                 [LANG(<locale>)]?",
             )),
         }
     }
@@ -491,7 +511,14 @@ impl ChannelCommandSearch {
 
     fn handle_query_meta(
         meta_result: MetaPartsResult,
-    ) -> Result<(Option<QuerySearchLimit>, Option<QuerySearchOffset>), ChannelCommandError> {
+    ) -> Result<
+        (
+            Option<QuerySearchLimit>,
+            Option<QuerySearchOffset>,
+            Option<QueryGenericLang>,
+        ),
+        ChannelCommandError,
+    > {
         match meta_result {
             Ok((meta_key, meta_value)) => {
                 debug!("handle query meta: {} = {}", meta_key, meta_value);
@@ -500,7 +527,7 @@ impl ChannelCommandSearch {
                     "LIMIT" => {
                         // 'LIMIT(<count>)' where 0 <= <count> < 2^16
                         if let Ok(query_limit_parsed) = meta_value.parse::<QuerySearchLimit>() {
-                            Ok((Some(query_limit_parsed), None))
+                            Ok((Some(query_limit_parsed), None, None))
                         } else {
                             Err(ChannelCommandBase::make_error_invalid_meta_value(
                                 &meta_key,
@@ -511,7 +538,18 @@ impl ChannelCommandSearch {
                     "OFFSET" => {
                         // 'OFFSET(<count>)' where 0 <= <count> < 2^32
                         if let Ok(query_offset_parsed) = meta_value.parse::<QuerySearchOffset>() {
-                            Ok((None, Some(query_offset_parsed)))
+                            Ok((None, Some(query_offset_parsed), None))
+                        } else {
+                            Err(ChannelCommandBase::make_error_invalid_meta_value(
+                                &meta_key,
+                                &meta_value,
+                            ))
+                        }
+                    }
+                    "LANG" => {
+                        // 'LANG(<locale>)' where <locale> ∈ ISO 639-3
+                        if let Some(query_lang_parsed) = QueryGenericLang::from_value(meta_value) {
+                            Ok((None, None, Some(query_lang_parsed)))
                         } else {
                             Err(ChannelCommandBase::make_error_invalid_meta_value(
                                 &meta_key,
@@ -570,22 +608,45 @@ impl ChannelCommandIngest {
             parts.next(),
             parts.next(),
             ChannelCommandBase::parse_text_parts(&mut parts),
-            parts.next(),
         ) {
-            (Some(collection), Some(bucket), Some(object), Some(text), None) => {
+            (Some(collection), Some(bucket), Some(object), Some(text)) => {
                 debug!(
                     "dispatching ingest push in collection: {}, bucket: {} and object: {}",
                     collection, bucket, object
                 );
                 debug!("ingest push has text: {}", text);
 
-                // Commit 'push' query
-                ChannelCommandBase::commit_ok_operation(QueryBuilder::push(
-                    collection, bucket, object, &text,
-                ))
+                // Define push parameters
+                let mut push_lang = None;
+
+                // Parse meta parts (meta comes after text; extract meta parts second)
+                let mut last_meta_err = None;
+
+                while let Some(meta_result) = ChannelCommandBase::parse_next_meta_parts(&mut parts)
+                {
+                    match Self::handle_push_meta(meta_result) {
+                        Ok(Some(push_lang_parsed)) => push_lang = Some(push_lang_parsed),
+                        Err(parse_err) => last_meta_err = Some(parse_err),
+                        _ => {}
+                    }
+                }
+
+                if let Some(err) = last_meta_err {
+                    Err(err)
+                } else {
+                    debug!(
+                        "will push for text: {} with hinted locale: <{:?}>",
+                        text, push_lang
+                    );
+
+                    // Commit 'push' query
+                    ChannelCommandBase::commit_ok_operation(QueryBuilder::push(
+                        collection, bucket, object, &text, push_lang,
+                    ))
+                }
             }
             _ => Err(ChannelCommandError::InvalidFormat(
-                "PUSH <collection> <bucket> <object> \"<text>\"",
+                "PUSH <collection> <bucket> <object> \"<text>\" [LANG(<locale>)]?",
             )),
         }
     }
@@ -690,32 +751,120 @@ impl ChannelCommandIngest {
     pub fn dispatch_help(parts: SplitWhitespace) -> ChannelResult {
         ChannelCommandBase::generic_dispatch_help(parts, &*MANUAL_MODE_INGEST)
     }
+
+    fn handle_push_meta(
+        meta_result: MetaPartsResult,
+    ) -> Result<Option<QueryGenericLang>, ChannelCommandError> {
+        match meta_result {
+            Ok((meta_key, meta_value)) => {
+                debug!("handle push meta: {} = {}", meta_key, meta_value);
+
+                match meta_key {
+                    "LANG" => {
+                        // 'LANG(<locale>)' where <locale> ∈ ISO 639-3
+                        if let Some(query_lang_parsed) = QueryGenericLang::from_value(meta_value) {
+                            Ok(Some(query_lang_parsed))
+                        } else {
+                            Err(ChannelCommandBase::make_error_invalid_meta_value(
+                                &meta_key,
+                                &meta_value,
+                            ))
+                        }
+                    }
+                    _ => Err(ChannelCommandBase::make_error_invalid_meta_key(
+                        &meta_key,
+                        &meta_value,
+                    )),
+                }
+            }
+            Err(err) => Err(ChannelCommandBase::make_error_invalid_meta_key(
+                &err.0, &err.1,
+            )),
+        }
+    }
 }
 
 impl ChannelCommandControl {
     pub fn dispatch_trigger(mut parts: SplitWhitespace) -> ChannelResult {
-        match (parts.next(), parts.next()) {
-            (None, _) => Ok(vec![ChannelCommandResponse::Result(format!(
+        match (parts.next(), parts.next(), parts.next()) {
+            (None, _, _) => Ok(vec![ChannelCommandResponse::Result(format!(
                 "actions({})",
                 CONTROL_TRIGGER_ACTIONS.join(", ")
             ))]),
-            (Some(action_key), next_part) => {
-                if next_part.is_none() == true {
-                    let action_key_lower = action_key.to_lowercase();
+            (Some(action_key), data_part, last_part) => {
+                let action_key_lower = action_key.to_lowercase();
 
-                    match action_key_lower.as_str() {
-                        "consolidate" => {
+                match action_key_lower.as_str() {
+                    "consolidate" => {
+                        if data_part.is_none() {
                             // Force a FST consolidate
                             StoreFSTPool::consolidate(true);
 
                             Ok(vec![ChannelCommandResponse::Ok])
+                        } else {
+                            Err(ChannelCommandError::InvalidFormat("TRIGGER consolidate"))
                         }
-                        _ => Err(ChannelCommandError::NotFound),
                     }
-                } else {
-                    Err(ChannelCommandError::InvalidFormat("HELP [<action>]?"))
+                    "backup" => {
+                        match (data_part, last_part) {
+                            (Some(path), None) => {
+                                // Proceed KV + FST backup
+                                let path = Path::new(path);
+
+                                if StoreKVPool::backup(&path.join(BACKUP_KV_PATH)).is_ok()
+                                    && StoreFSTPool::backup(&path.join(BACKUP_FST_PATH)).is_ok()
+                                {
+                                    Ok(vec![ChannelCommandResponse::Ok])
+                                } else {
+                                    Err(ChannelCommandError::InternalError)
+                                }
+                            }
+                            _ => Err(ChannelCommandError::InvalidFormat("TRIGGER backup <path>")),
+                        }
+                    }
+                    "restore" => {
+                        match (data_part, last_part) {
+                            (Some(path), None) => {
+                                // Proceed KV + FST restore
+                                let path = Path::new(path);
+
+                                if StoreKVPool::restore(&path.join(BACKUP_KV_PATH)).is_ok()
+                                    && StoreFSTPool::restore(&path.join(BACKUP_FST_PATH)).is_ok()
+                                {
+                                    Ok(vec![ChannelCommandResponse::Ok])
+                                } else {
+                                    Err(ChannelCommandError::InternalError)
+                                }
+                            }
+                            _ => Err(ChannelCommandError::InvalidFormat("TRIGGER restore <path>")),
+                        }
+                    }
+                    _ => Err(ChannelCommandError::NotFound),
                 }
             }
+        }
+    }
+
+    pub fn dispatch_info(mut parts: SplitWhitespace) -> ChannelResult {
+        match parts.next() {
+            None => {
+                let statistics = ChannelStatistics::gather();
+
+                Ok(vec![ChannelCommandResponse::Result(format!(
+                    "uptime({}) clients_connected({}) commands_total({}) \
+                     command_latency_best({}) command_latency_worst({}) \
+                     kv_open_count({}) fst_open_count({}) fst_consolidate_count({})",
+                    statistics.uptime,
+                    statistics.clients_connected,
+                    statistics.commands_total,
+                    statistics.command_latency_best,
+                    statistics.command_latency_worst,
+                    statistics.kv_open_count,
+                    statistics.fst_open_count,
+                    statistics.fst_consolidate_count
+                ))])
+            }
+            _ => Err(ChannelCommandError::InvalidFormat("INFO")),
         }
     }
 

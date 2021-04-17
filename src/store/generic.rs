@@ -8,8 +8,7 @@ use core::cmp::Eq;
 use core::hash::Hash;
 use hashbrown::HashMap;
 use std::fmt::Display;
-use std::mem;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 pub trait StoreGenericKey {}
@@ -38,7 +37,7 @@ pub trait StoreGenericPool<
         // Bump store last used date (avoids early janitor eviction)
         let mut last_used_value = store.ref_last_used().write().unwrap();
 
-        mem::replace(&mut *last_used_value, SystemTime::now());
+        *last_used_value = SystemTime::now();
 
         // Perform an early drop of the lock (frees up write lock early)
         drop(last_used_value);
@@ -78,13 +77,21 @@ pub trait StoreGenericPool<
         }
     }
 
-    fn proceed_janitor(kind: &str, pool: &Arc<RwLock<HashMap<K, Arc<S>>>>, inactive_after: u64) {
+    fn proceed_janitor(
+        kind: &str,
+        pool: &Arc<RwLock<HashMap<K, Arc<S>>>>,
+        inactive_after: u64,
+        access_lock: &Arc<RwLock<bool>>,
+    ) {
         debug!("scanning for {} store pool items to janitor", kind);
 
-        let mut store_pool_write = pool.write().unwrap();
+        // Acquire access lock (in blocking write mode), and reference it in context
+        // Notice: this prevents store to be acquired from any context
+        let _access = access_lock.write().unwrap();
+
         let mut removal_register: Vec<K> = Vec::new();
 
-        for (collection_bucket, store) in store_pool_write.iter() {
+        for (collection_bucket, store) in pool.read().unwrap().iter() {
             let last_used_elapsed = store
                 .ref_last_used()
                 .read()
@@ -110,15 +117,19 @@ pub trait StoreGenericPool<
             }
         }
 
-        for collection_bucket in &removal_register {
-            store_pool_write.remove(collection_bucket);
+        if !removal_register.is_empty() {
+            let mut store_pool_write = pool.write().unwrap();
+
+            for collection_bucket in &removal_register {
+                store_pool_write.remove(collection_bucket);
+            }
         }
 
         info!(
             "done scanning for {} store pool items to janitor, expired {} items, now has {} items",
             kind,
             removal_register.len(),
-            store_pool_write.len()
+            pool.read().unwrap().len()
         );
     }
 }
@@ -136,17 +147,10 @@ pub trait StoreGenericActionBuilder {
         kind: &str,
         collection: T,
         bucket: Option<T>,
-        access_lock: &Arc<RwLock<bool>>,
-        write_lock: &Arc<Mutex<bool>>,
     ) -> Result<u32, ()> {
         let collection_str = collection.into();
 
         info!("{} erase requested on collection: {}", kind, collection_str);
-
-        // Acquire write + access locks, and reference it in context
-        // Notice: write lock prevents store to be acquired from any context; while access lock \
-        //   lets the erasure process wait that any thread using the store is done with work.
-        let (_access, _write) = (access_lock.write().unwrap(), write_lock.lock().unwrap());
 
         if let Some(bucket) = bucket {
             Self::proceed_erase_bucket(collection_str, bucket.into())
